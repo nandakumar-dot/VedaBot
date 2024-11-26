@@ -1,0 +1,13 @@
+Flask
+python-dotenv
+python-telegram-bot
+google-generativeai
+telegram
+langchain
+langchain-google-genai
+langchain-community
+PyPDF2
+python-docx
+faiss-cpu
+groq
+gunicorn
