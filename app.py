@@ -14,12 +14,13 @@ from langchain_core.output_parsers import StrOutputParser
 from PyPDF2 import PdfReader
 from docx import Document as DocxDocument
 from groq import Groq
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+from database import Database
 
 class TelegramAIAssistant:
-    def __init__(self, telegram_token: str, google_api_key: str, groq_api_key: str):
-        self.telegram_token = telegram_token
-        os.environ["GOOGLE_API_KEY"] = google_api_key
-        
+    def __init__(self, telegram_token: str, google_api_key: str, groq_api_key: str, mongodb_uri: str):
+        self.telegram_token = telegram_token        
         try:
             from google.generativeai import configure
             configure(api_key=google_api_key)
@@ -28,32 +29,15 @@ class TelegramAIAssistant:
             print(f"API Configuration Error: {e}")
             sys.exit(1)
 
-        self.file_cache: Dict[str, Dict] = {}
-        self.max_cache_size = 100
-
         try:
             self.embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-            self.vector_store = self._load_or_create_vector_store()
         except Exception as e:
             print(f"Vector Store Initialization Error: {e}")
             sys.exit(1)
 
+        self.db = Database(mongodb_uri)
+
         self.qa_chain = self._get_qa_chain()
-
-    def _load_or_create_vector_store(self):
-        permanent_index_dir = "permanent_index"
-        os.makedirs(permanent_index_dir, exist_ok=True)
-        
-        try:
-            return FAISS.load_local(permanent_index_dir, self.embeddings, allow_dangerous_deserialization=True)
-        except Exception:
-            return FAISS.from_texts(["Initial text"], self.embeddings)
-
-    def _save_vector_store(self):
-        try:
-            self.vector_store.save_local("permanent_index")
-        except Exception as e:
-            print(f"Vector Store Save Error: {e}")
 
     def _get_qa_chain(self):
         prompt_template = """
@@ -88,22 +72,9 @@ class TelegramAIAssistant:
             | StrOutputParser()
         )
 
-    def save_file(self, file_bytes: bytes, file_name: str, mime_type: str):
-        if len(self.file_cache) >= self.max_cache_size:
-            self.file_cache.pop(list(self.file_cache.keys())[0])
-        
-        self.file_cache[file_name] = {
-            'bytes': file_bytes,
-            'mime_type': mime_type
-        }
-        return file_name
+    def extract_text_from_file(self, file_bytes: bytes, file_name: str) -> Optional[str]:
 
-    def extract_text_from_file(self, file_name: str) -> Optional[str]:
-        file_info = self.file_cache.get(file_name)
-        if not file_info:
-            return None
-
-        file_like = io.BytesIO(file_info['bytes'])
+        file_like = io.BytesIO(file_bytes)
         
         try:
             if file_name.lower().endswith('.pdf'):
@@ -138,50 +109,55 @@ class TelegramAIAssistant:
             return None
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.message.from_user.id)
+        user_name = update.message.from_user.full_name
+        self.db.add_user(user_id, user_name)
         try:
             user_question = update.message.text
+
+            user_embeddings = self.db.get_user_embeddings(user_id)
+            if not user_embeddings:
+                await update.message.reply_text("No context available. Please upload documents first.")
+                return
             
-            docs = self.vector_store.similarity_search(user_question, k=3)
+            docs = [
+                Document(page_content=e["metadata"]["context"]) 
+                for e in user_embeddings
+            ]
+            response_text = self.qa_chain.invoke({'docs': docs, 'question': user_question})
             
-            response_text = self.qa_chain.invoke({
-                'docs': docs, 
-                'question': user_question
-            })
-            
-            max_length = 4096
-            if len(response_text) > max_length:
-                for chunk in (response_text[i:i+max_length] for i in range(0, len(response_text), max_length)):
-                    await update.message.reply_text(chunk)
-            else:
-                await update.message.reply_text(response_text)
-        
+            await update.message.reply_text(response_text)
+
         except Exception as e:
             print(f"Message handling error: {e}")
             await update.message.reply_text("Error: Unable to process your request.")
 
+
     async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user_id = str(update.message.from_user.id)
+        user_name = update.message.from_user.full_name
+        self.db.add_user(user_id, user_name)
+
         try:
             file = await update.message.document.get_file()
-            
             file_bytes = await file.download_as_bytearray()
             file_name = update.message.document.file_name
             mime_type = update.message.document.mime_type
 
-            saved_file_name = self.save_file(file_bytes, file_name, mime_type)
-            
             text = None
             if mime_type == 'application/pdf' or file_name.lower().endswith('.pdf'):
-                text = self.extract_text_from_file(saved_file_name)
+                text = self.extract_text_from_file(file_bytes, file_name)
             elif mime_type == 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' or file_name.lower().endswith('.docx'):
-                text = self.extract_text_from_file(saved_file_name)
+                text = self.extract_text_from_file(file_bytes, file_name)
             elif mime_type.startswith('image/'):
                 text = await self.process_image_with_groq(file_bytes)
 
             if text:
-                doc = Document(page_content=text)
-                self.vector_store.add_documents([doc])
-                self._save_vector_store()
+                document_id = self.db.add_document(user_id, file_name, mime_type, text)
                 
+                embedding_vector = self.embeddings.embed_documents([text])
+                self.db.add_embedding(user_id, document_id, embedding_vector[0], context=text[:200])
+
                 await update.message.reply_text(f"✅ {file_name} processed successfully!")
             else:
                 await update.message.reply_text("⚠️ Unable to extract text from the file.")
@@ -189,6 +165,7 @@ class TelegramAIAssistant:
         except Exception as e:
             print(f"File handling error: {e}")
             await update.message.reply_text("⚠️ Error processing the file.")
+
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         welcome_message = (
@@ -217,7 +194,8 @@ def main():
     assistant = TelegramAIAssistant(
         telegram_token=os.getenv("TELEGRAM_TOKEN"),
         google_api_key=os.getenv("GOOGLE_API_KEY"),
-        groq_api_key=os.getenv("GROQ_API_KEY")
+        groq_api_key=os.getenv("GROQ_API_KEY"),
+        mongodb_uri=os.getenv("MONGODB_URI")
     )
     
     assistant.run()

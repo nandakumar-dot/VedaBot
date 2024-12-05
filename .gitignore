@@ -1,3 +1,4 @@
 .env
 venv/
 permanent_index/
+__pycache__
